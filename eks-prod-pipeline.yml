@@ -1,0 +1,107 @@
+trigger:
+  none
+#- main
+resources:
+- repo: self
+
+variables:
+  containerRegistry: 'hamzaarja'
+  imageRepository: 'flask-app'
+  tag: '$(Build.BuildId)'
+  ImageName: 'hamzaarja/flask-app'
+
+stages:
+- stage: Build
+  displayName: Build image
+  jobs: 
+    - job: Build
+      displayName: Build and push Docker image
+      pool:
+        name: ec2pool
+        demands:
+          - Agent.Name -equals ec2agent
+      steps:
+      - script: |
+          sed -i '10i\ENV FLASK_ENV=prod' Dockerfile
+        displayName: 'Update deployment image tag'
+      - task: Docker@2
+        displayName: 'Build the Docker image'
+        inputs:
+          containerRegistry: 'docker-registery-scn'
+          repository: '$(ImageName)'
+          command: 'build'
+          Dockerfile: '$(Build.SourcesDirectory)/Dockerfile'
+          tags: |
+            $(Build.BuildId)
+
+      - task: Docker@2
+        displayName: 'Push the Docker image to Dockerhub'
+        inputs:
+          containerRegistry: 'docker-registery-scn'
+          repository: '$(ImageName)'
+          command: 'push'
+        condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+- stage: Test
+  displayName: Run Tests
+  jobs: 
+    - job: Test
+      displayName: Run Application Tests
+      pool:
+        name: ec2pool
+        demands:
+          - Agent.Name -equals ec2agent
+      steps:
+      - script: |
+          docker run --rm $(ImageName):$(tag) pytest test_healthcheck.py --disable-warnings -q
+        displayName: 'Run Health Check Tests'
+        condition: succeeded()
+- stage: CleanUp
+  displayName: Docker Clean up
+  jobs: 
+    - job: CleanUp
+      displayName: Docker image Clean up
+      pool:
+        name: ec2pool
+        demands:
+          - Agent.Name -equals ec2agent
+      steps:
+      - task: Bash@3
+        displayName: 'Cleaning Docker images'
+        inputs:
+          targetType: 'inline'
+          script: |
+            docker rmi -f $(ImageName):$(Build.BuildId)
+
+- stage: Deploy
+  displayName: Kubernetes Deployment
+  jobs: 
+    - job: Deploy
+      displayName: Kubernetes deployment
+      pool:
+        name: ec2pool
+        demands:
+          - Agent.Name -equals ec2agent
+      steps:
+      - script: |
+          curl -LO "https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x ./kubectl
+          sudo mv ./kubectl /usr/local/bin/kubectl
+          aws eks --region eu-west-1 update-kubeconfig --name testc1
+        displayName: 'Install kubectl & Configure'
+      
+      - script: |
+          kubectl version --client
+        displayName: 'Check kubectl version'
+
+      - script: |
+          sed -i 's|image: .*|image: $(ImageName):$(tag)|' flask-deployment-prod.yaml
+          cat flask-deployment-prod.yaml
+        displayName: 'Update deployment image tag'
+
+      - task: Kubernetes@1
+        displayName: 'Deploy to Kubernetes'
+        inputs:
+          namespace: 'default'
+          command: 'apply'
+          arguments: '-f flask-deployment-prod.yaml'
+          kubernetesServiceEndpoint: 'kubernetes-scn-prod'
